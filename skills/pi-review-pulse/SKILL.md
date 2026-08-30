@@ -111,6 +111,50 @@ Pass `--schedule-reanchored` to `complete-wake` only after `schedule_prompt add`
 returns a real `jobId`. These flags do not pause or schedule a job themselves;
 the flag value is never evidence that `schedule_prompt add` succeeded.
 
+### Mandatory pi wake boundary
+
+One pi agent run may execute exactly one pulse wake. A wake may start only from
+one of these externally delivered messages:
+
+- the user's initial explicit request; or
+- a new user message actually delivered by a fired `schedule_prompt` one-shot.
+
+A tool result, todo rollover, notebook entry, model decision, or the mere
+existence of an enabled successor job is never a new wake. Before every
+`begin-wake`, read the checkpoint and inspect `active_wake_id`,
+`failure_latch`, and `next_not_before` directly. If an active wake or any
+failure latch exists, or if current UTC is earlier than `next_not_before`, stop
+without calling `begin-wake`, without clearing state, and without registering
+another job. Do not summarize those fields from memory or continue against a
+contradictory tool result. A missing checkpoint is allowed only for the user's
+initial explicit request; on a scheduled wake, a missing or unreadable
+checkpoint is a hard stop.
+
+Generate a fresh opaque `wake_id` only after the external wake message has been
+delivered. Never reuse a wake ID from a prompt, notebook, todo, checkpoint, or
+prior failed attempt. Reuse that fresh ID only within the one current wake.
+
+After an eligible wake registers its one-shot successor and calls
+`complete-wake` exactly once, the current pi agent run is over. Return the final
+wake status immediately and make no further tool calls. In particular, do not
+list or inspect the successor, roll todos to the next wake, claim it was
+consumed, or call `begin-wake` again. Only the future scheduled user message may
+start that successor wake.
+
+`pi-schedule-prompt` status is evidence, not decoration. The glyph describes
+enablement, not execution: `✓` means enabled, `✗` means disabled, and `!` means
+error. Determine consumption from `Runs` and `Status`, never from the glyph
+alone:
+
+- `Never run`, `Runs: 0`, and `Status: pending` means a one-shot has not fired,
+  whether it is enabled or disabled; it has not been consumed;
+- `Runs: 1` and `Status: success` means that one-shot fired successfully; a
+  following `✗` is the normal auto-disabled state, not a failure;
+- `Status: error` means scheduler failure.
+
+Never report an unfired one-shot as consumed. The scheduler list and storage
+are project-directory scoped, so inspect them only from the target checkout.
+
 ### Default CLI/host sequence
 
 The executing pi agent owns the `schedule_prompt` operations; `pulse.py` only
@@ -122,6 +166,14 @@ there is no scheduler pause step.
 ```text
 PULSE = "python skills/pi-review-pulse/scripts/pulse.py"
 TARGET = "--repository-path PR_CHECKOUT --repo OWNER/REPO --pr NUMBER"
+
+# Enter only after an initial explicit user request or an actually delivered
+# scheduled user message. Read checkpoint fields directly before begin-wake.
+if active_wake_id is not null or failure_latch is not null:
+    end this agent run without begin-wake or scheduling
+if next_not_before is not null and CURRENT_UTC < next_not_before:
+    end this agent run without begin-wake or scheduling
+WAKE_ID = new opaque ID generated for this delivered message
 
 # Use the same WAKE_ID for begin, snapshot, freeze, record, resolve, retry,
 # publication-result, trigger-result, and complete-wake.
@@ -169,12 +221,15 @@ reanchor = schedule_prompt add(
 JOB_ID = reanchor.jobId
 PULSE TARGET --wake-id WAKE_ID --now COMPLETION_NOW complete-wake \
   --schedule-reanchored
+# HARD STOP: return the final status and end this pi agent run now.
+# Do not call schedule_prompt list, reread the checkpoint, roll next-wake
+# todos, or invoke begin-wake. The scheduled user message is the only successor.
 
 # If schedule_prompt add fails or does not return a jobId, do not pass
 # --schedule-reanchored:
 PULSE TARGET --wake-id WAKE_ID --now COMPLETION_NOW complete-wake
 # This persists PAUSE_BLOCKED / scheduled_task_reanchor_unavailable.
-# Never replace this one-shot add with a fixed interval.
+# HARD STOP here too. Never replace this one-shot add with a fixed interval.
 ```
 
 The agent must inspect the actual `schedule_prompt add` response and require a
@@ -201,6 +256,11 @@ that heartbeat. Continue only after the host confirms the pause. If pause
 confirmation is unavailable or fails, persist `PAUSE_BLOCKED`, keep the
 heartbeat paused, and end the turn without snapshot, freeze, resolve, commit,
 push, trigger, or another plan.
+
+For the pi adapter, that pause confirmation maps only to the no-op
+`--pause-confirmed` acknowledgement described above because there is no
+concurrent timer to pause. It does not relax the one-delivered-message boundary
+and never authorizes entering the successor wake in the same agent run.
 
 Persist an opaque `wake_id` and at least these fields in the default checkpoint:
 
@@ -287,31 +347,45 @@ verifiable external authority.
 The Python entry point does not call a private Codex automation API. The
 executing pi agent owns the following one-shot self-rescheduling handoff:
 
-1. Treat the user's initial task as wake 1.
-2. Pi has no concurrent background timer to pause. Do not create a recurring
+1. Treat the user's initial task as wake 1. Every later wake requires a newly
+   delivered scheduled user message; remaining in the same agent run is not a
+   new wake.
+2. Before `begin-wake`, inspect the checkpoint directly. Any non-null
+   `active_wake_id` or `failure_latch`, or an unelapsed `next_not_before`, ends
+   the agent run without `begin-wake` and without scheduling.
+3. Generate a fresh opaque wake ID for this delivered message. Never reuse an
+   ID from checkpoint state, notebook grounding, todos, or an earlier attempt.
+4. Pi has no concurrent background timer to pause. Do not create a recurring
    task or perform a pause operation before `begin-wake`; invoke the unchanged
    CLI with `--pause-confirmed` only as the no-op acknowledgement that no pi
    timer needs pausing.
-3. Run this wake's snapshot, frozen batch, repair/retry, outcome/resolve, and
+5. Run this wake's snapshot, frozen batch, repair/retry, outcome/resolve, and
    aggregate publication work.
-4. For `WAIT_REVIEW`, `WAIT_RETRY`, or successful same-head `REQUEST_REVIEW`, choose one
+6. For `WAIT_REVIEW`, `WAIT_RETRY`, or successful same-head `REQUEST_REVIEW`, choose one
    completion timestamp and compute
    `next_not_before = wake_completed_at + cadence_seconds` without calling
    `complete-wake` yet.
-5. Call `schedule_prompt add` with `type=once` and
+7. Build `PI_WAKE_PROMPT` so it identifies itself as a newly delivered one-shot
+   wake and repeats the checkpoint preflight and fresh-ID requirements. Call
+   `schedule_prompt add` with `type=once` and
    `schedule=+<cadence_seconds>s`, then inspect the actual response.
-6. Require the returned non-empty `jobId`; this is the only proof that the
-   one-shot successor job was registered. Do not use a fixed interval.
-7. After `schedule_prompt add` succeeds, call `complete-wake` exactly once with
+8. Require the returned non-empty `jobId`; this proves only that the one-shot
+   successor was registered, not that it fired. An enabled pending job remains
+   future work. Do not use a fixed interval.
+9. After `schedule_prompt add` succeeds, call `complete-wake` exactly once with
    the same completion timestamp and `--schedule-reanchored`.
-8. If `schedule_prompt add` fails or returns no `jobId`, call `complete-wake`
-   exactly once without `--schedule-reanchored`; this persists the re-anchor
-   blocker and keeps the disposition `PAUSED`.
-9. On `PAUSE_*` or `STOP_*`, do not call `schedule_prompt add`; end the wake
-   without registering a next job. On any other tool failure or unproven
-   success, do the same. Never treat a model assertion, boolean argument, or
-   natural-language claim as proof that scheduling succeeded.
-10. `pi-schedule-prompt` fires only while a pi session is open in the target
+10. Immediately after that `complete-wake` result, return the final wake status
+    and end the current pi agent run. Make no more tool calls: do not list or
+    inspect the successor, roll todos forward, reread checkpoint state, or
+    invoke `begin-wake`.
+11. If `schedule_prompt add` fails or returns no `jobId`, call `complete-wake`
+    exactly once without `--schedule-reanchored`; this persists the re-anchor
+    blocker. Then immediately end the current agent run.
+12. On `PAUSE_*` or `STOP_*`, do not call `schedule_prompt add`; end the wake
+    without registering a next job. On any other tool failure or unproven
+    success, do the same. Never treat a model assertion, boolean argument, or
+    natural-language claim as proof that scheduling succeeded.
+13. `pi-schedule-prompt` fires only while a pi session is open in the target
     directory; when no such session is open, nothing is queued. This is why
     every eligible wake self-registers one `type=once` successor instead of
     relying on a fixed interval. This handoff is not production-validated yet.
