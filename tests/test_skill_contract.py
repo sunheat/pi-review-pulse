@@ -81,6 +81,14 @@ class PiSchedulingContractTests(unittest.TestCase):
         self.assertIn("the normal auto-disabled state, not a failure", self.skill)
         self.assertIn("Never report an unfired one-shot as consumed", self.skill)
 
+    def test_unsupported_confirmation_modes_are_not_claimed_as_supported(self) -> None:
+        self.assertIn(
+            "former `supervised` profile and every `confirm` mutation policy are unsupported",
+            self.skill,
+        )
+        self.assertIn("confirmation/resume protocol", self.skill)
+        self.assertIn("are rejected rather than converted into another mode", self.skill)
+
     def test_handoff_requires_one_shot_and_immediate_turn_end(self) -> None:
         handoff = self.skill[self.skill.index("## Scheduled-task handoff") :]
         self.assertIn("`schedule_prompt add` with `type=once`", handoff)

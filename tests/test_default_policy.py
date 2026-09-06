@@ -32,21 +32,29 @@ class DefaultPolicyTests(unittest.TestCase):
         self.assertEqual(policy["thread_resolution"], "auto")
         self.assertEqual(policy["review_trigger"], "auto")
 
-    def test_profile_and_explicit_overrides_are_deterministic(self) -> None:
+    def test_observe_only_profile_and_explicit_overrides_are_deterministic(self) -> None:
         policy = apply_policy_overrides(
             None,
             {
-                "profile": "supervised",
+                "profile": "observe-only",
                 "max_wakes": 5,
                 "cadence_seconds": 1800,
-                "allow_test_changes": True,
+                "allow_test_changes": False,
             },
         )
-        self.assertEqual(policy["profile"], "supervised")
-        self.assertEqual(policy["publication"], "confirm")
-        self.assertEqual(policy["thread_resolution"], "confirm")
+        self.assertEqual(policy["profile"], "observe-only")
+        self.assertEqual(policy["publication"], "never")
+        self.assertEqual(policy["thread_resolution"], "never")
         self.assertEqual(policy["cadence_seconds"], 1800)
         self.assertEqual(policy["max_wakes"], 5)
+
+    def test_supervised_and_confirm_modes_are_explicitly_unsupported(self) -> None:
+        with self.assertRaisesRegex(PolicyError, "unsupported"):
+            apply_policy_overrides(None, {"profile": "supervised"})
+        for field in ("publication", "thread_resolution", "review_trigger"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(PolicyError, "unsupported"):
+                    apply_policy_overrides(None, {field: "confirm"})
 
     def test_deadline_is_canonicalized_and_digest_is_stable(self) -> None:
         policy = normalize_policy(

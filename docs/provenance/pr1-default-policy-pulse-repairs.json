@@ -1,0 +1,61 @@
+{
+  "upstream": {
+    "repository": "sunheat/codex-review-pulse",
+    "commit": "d0a1a0073d15aa5eb88c511f3d77ffc77baee93b"
+  },
+  "mappings": [
+    {
+      "source_path": "skills/codex-review-pulse/scripts/default_policy.py",
+      "source_git_blob_oid": "759f6b14430fa879ee418d591c243f8a69c6f180",
+      "source_content_sha256": "84b63ba7a37ff09e761600325929fe6b3df4516d140131ce0adc89a733fb0cb1",
+      "destination_path": "skills/pi-review-pulse/scripts/default_policy.py",
+      "destination_content_sha256": "509570695bf6671b3a849246aaac34c01cce619c0f692c052b620b0b2ec8962c",
+      "pi_local_adaptations": [
+        "The Pi candidate removes the supervised profile defaults and the confirm mutation-policy value, then rejects each at policy normalization with an explicit unsupported/no-confirmation-resume-protocol error.",
+        "Autonomous and observe-only policy defaults remain available; unsupported values are not silently rewritten to auto or never."
+      ],
+      "exclusions": [
+        "The source supervised profile defaults and confirm mutation-policy flow are excluded because this Pi port has no confirmation/resume protocol."
+      ]
+    },
+    {
+      "source_path": "skills/codex-review-pulse/scripts/pulse.py",
+      "source_git_blob_oid": "0302824aa14bd7e936c2ee6503eab41d8782ea68",
+      "source_content_sha256": "28e0b4c19a528a4d3d39a84d26d79fd0cf2c5d92b43066c3b4b5d54b84c71b6e",
+      "destination_path": "skills/pi-review-pulse/scripts/pulse.py",
+      "destination_content_sha256": "5c77d9467db4173241aaf0656bccc09f3ee320651ba444015e24317c65b04ddb",
+      "pi_local_adaptations": [
+        "The Pi candidate records last_snapshot_wake_id and performs _snapshot_replay before CLI snapshot retrieval or evaluation, replaying only a current-wake owned snapshot/decision.",
+        "The Pi candidate keeps wake_mutation_occurred monotonic through exact resolution, publication, trigger, pause, terminal, and completion results, and resets it at wake start/end.",
+        "The Pi candidate validates policy overrides before assigning them to a checkpoint and accepts configure-policy --policy-json after the subcommand with argparse.SUPPRESS, while retaining the root-before-subcommand form."
+      ],
+      "exclusions": [
+        "Source heartbeat scheduling symbols are excluded: HEARTBEAT_PROTOCOL_VERSION, SCHEDULE_REANCHOR_TOLERANCE, HEARTBEAT_BATCH_ORDER, build_heartbeat_handoff, _ceil_to_second, and _schedule_times_match.",
+        "Source confirmation/resume symbols are excluded: _policy_confirmation_allows, _consume_policy_confirmation, _consume_thread_resolution_confirmation, and confirm_policy_operation.",
+        "Source prepare_default_publication is excluded; this Pi candidate does not copy the source publication-planning flow."
+      ]
+    }
+  ],
+  "conformance_results": [
+    {
+      "command": "python3 -m unittest discover -s tests -v",
+      "result": "passed",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -m compileall -q skills/pi-review-pulse/scripts tests",
+      "result": "passed",
+      "exit_code": 0
+    },
+    {
+      "command": "candidate-only git diff --no-index --check against /tmp/pi-pr1-local-vab0gsp5/before",
+      "result": "passed",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check",
+      "result": "unchanged-preexisting-failure",
+      "exit_code": 2
+    }
+  ]
+}

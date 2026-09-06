@@ -97,12 +97,14 @@ to the corresponding JSON fields before the initial `begin-wake`, for example:
 
 `--policy-json` accepts the same object on the initial wake. Outside an active
 wake, `configure-policy --policy-json '{...}'` updates the persisted policy;
-policy changes are never made halfway through a frozen batch. Useful explicit
-profiles are `supervised` (confirm publication, resolution, and triggers) and
-`observe-only` (no PR mutations). A prompt such as “keep working unattended,
-update stale PR-scoped tests when the implementation is correct, and retry
-transient failures until the review is clean” selects the default autonomous
-profile and needs no extra flags.
+policy changes are never made halfway through a frozen batch. The supported
+profiles are `autonomous` and `observe-only` (`never` mutation policies). The
+former `supervised` profile and every `confirm` mutation policy are unsupported
+in this Pi port and are rejected at policy entry/configuration; there is no
+confirmation/resume protocol or silent downgrade to `auto`/`never`. A prompt
+such as “keep working unattended, update stale PR-scoped tests when the
+implementation is correct, and retry transient failures until the review is
+clean” selects the default autonomous profile and needs no extra flags.
 
 In pi, there is no concurrent background timer to pause. The unchanged CLI
 still accepts `--pause-confirmed`; pass it as the no-op acknowledgement that no
@@ -271,8 +273,12 @@ Persist an opaque `wake_id` and at least these fields in the default checkpoint:
 - `next_not_before`
 - `scheduled_task_disposition`
 - `wake_count`
+- `last_snapshot_wake_id`
+- `wake_mutation_occurred` (the current wake's monotonic mutation audit)
 
-One host wake may successfully begin and plan once. Repeating `plan` or
+A snapshot replay is authorized only when `last_snapshot_wake_id` matches the
+current wake; an older `last_snapshot` is not current-wake evidence. One host
+wake may successfully begin and plan once. Repeating `plan` or
 `snapshot` with the same `wake_id` returns the prior result or rejects without
 incrementing `wake_count`. Lease renewal, snapshot refresh, completion, and
 recovery inspection are not new wakes. A stale or incomplete marker produces
@@ -416,8 +422,9 @@ targeted Codex thread exact resolution including recorded no-fix outcomes, one
 aggregate commit and push per batch, one trigger per head, and creation/update/
 pause/reanchor of one same-task heartbeat. It remains active across scheduled
 wakes until a Codex-specific terminal result or a hard blocker. A prompt can
-narrow this scope by selecting `supervised`, `observe-only`, explicit limits,
-`allow_test_changes=false`, or confirmation policies. It never authorizes issue
+narrow this scope by selecting `observe-only`, explicit limits, or
+`allow_test_changes=false`. Unsupported `supervised`/`confirm` policy values
+are rejected rather than converted into another mode. It never authorizes issue
 creation, merge, auto-merge, base changes, force-pushes, generic reviewers,
 non-target threads, or unrelated changes.
 

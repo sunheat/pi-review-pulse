@@ -31,6 +31,7 @@ NOW = "2026-08-26T00:00:00+00:00"
 fixture_path = Path(os.environ["PULSE_FAKE_GH_FIXTURE"])
 fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
 counts_path = Path(os.environ["PULSE_FAKE_GH_COUNTS"])
+graphql_counts_path = Path(os.environ["PULSE_FAKE_GH_GRAPHQL_COUNTS"])
 
 
 def output(payload):
@@ -82,6 +83,8 @@ if arguments[:3] != ["api", "graphql", "-F"]:
     print("unsupported fake gh command", file=sys.stderr)
     raise SystemExit(2)
 
+count = int(graphql_counts_path.read_text(encoding="utf-8")) if graphql_counts_path.exists() else 0
+graphql_counts_path.write_text(str(count + 1), encoding="utf-8")
 query = sys.stdin.read()
 if "resolveReviewThread" in query:
     thread_id = next(
@@ -145,6 +148,7 @@ class CliHarness:
         )
         self.fixture_path = root / "fixture.json"
         self.counts_path = root / "mutation-count.txt"
+        self.graphql_counts_path = root / "graphql-count.txt"
         self.write_fixture(fixture or self.default_fixture())
 
     @staticmethod
@@ -170,11 +174,15 @@ class CliHarness:
     def mutation_count(self) -> int:
         return int(self.counts_path.read_text(encoding="utf-8")) if self.counts_path.exists() else 0
 
+    def graphql_count(self) -> int:
+        return int(self.graphql_counts_path.read_text(encoding="utf-8")) if self.graphql_counts_path.exists() else 0
+
     def run(self, *command: str, wake_id: str = "wake-1", now: str = NOW) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["PATH"] = str(self.fake_bin) + os.pathsep + environment.get("PATH", "")
         environment["PULSE_FAKE_GH_FIXTURE"] = str(self.fixture_path)
         environment["PULSE_FAKE_GH_COUNTS"] = str(self.counts_path)
+        environment["PULSE_FAKE_GH_GRAPHQL_COUNTS"] = str(self.graphql_counts_path)
         environment["CODEX_REVIEW_PULSE_GH_SCRIPT"] = str(self.fake_bin / "fake_gh.py")
         arguments = [
             sys.executable,
@@ -273,6 +281,137 @@ class PulseCliTests(unittest.TestCase):
         self.assertEqual(state["automation_policy"]["max_wakes"], 8)
         self.assertFalse(state["automation_policy"]["allow_test_changes"])
         self.assertEqual(state["automation_policy"]["notifications"], "every-wake")
+
+    def test_configure_policy_accepts_subcommand_policy_json_and_rejects_invalid_values(self) -> None:
+        harness = CliHarness(self)
+        harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
+        harness.json_output(harness.run("snapshot"))
+        harness.json_output(
+            harness.run(
+                "complete-wake",
+                "--schedule-reanchored",
+                now="2026-08-26T00:01:00+00:00",
+            )
+        )
+        updated = harness.json_output(
+            harness.run(
+                "configure-policy",
+                "--policy-json",
+                '{"max_wakes": 7, "notifications": "silent"}',
+            )
+        )
+        self.assertEqual(updated["next_action"], "POLICY_UPDATED")
+        path = checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        before = load_checkpoint(path)
+        invalid_json = harness.run("configure-policy", "--policy-json", "not-json")
+        self.assertNotEqual(invalid_json.returncode, 0)
+        self.assertIn("valid JSON", invalid_json.stderr)
+        invalid_object = harness.run("configure-policy", "--policy-json", "[]")
+        self.assertNotEqual(invalid_object.returncode, 0)
+        self.assertIn("JSON object", invalid_object.stderr)
+        self.assertEqual(load_checkpoint(path), before)
+
+    def test_cli_rejects_unsupported_policy_modes_without_changing_checkpoint(self) -> None:
+        harness = CliHarness(self)
+        harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
+        before = load_checkpoint(
+            checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        )
+        rejected_profile = harness.run(
+            "--policy-json",
+            '{"profile": "supervised"}',
+            "begin-wake",
+            "--pause-confirmed",
+        )
+        self.assertNotEqual(rejected_profile.returncode, 0)
+        self.assertIn("unsupported", rejected_profile.stderr)
+        rejected_confirm = harness.run(
+            "--policy-json",
+            '{"publication": "confirm"}',
+            "begin-wake",
+            "--pause-confirmed",
+        )
+        self.assertNotEqual(rejected_confirm.returncode, 0)
+        self.assertIn("unsupported", rejected_confirm.stderr)
+        after = load_checkpoint(
+            checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        )
+        self.assertEqual(after, before)
+
+    def test_cli_duplicate_snapshot_replays_before_fetch_and_freeze(self) -> None:
+        fixture = CliHarness.default_fixture()
+        fixture["threads"] = [{"id": "T1", "root_author": "chatgpt-codex-connector"}]
+        harness = CliHarness(self, fixture=fixture)
+        harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
+        first = harness.json_output(harness.run("snapshot"))
+        graphql_calls = harness.graphql_count()
+        changed = harness.read_fixture()
+        changed.update(
+            {
+                "head_oid": "HEAD2",
+                "threads": [{"id": "T2", "root_author": "chatgpt-codex-connector"}],
+                "eyes": [{"id": "EYES2", "user": {"login": "chatgpt-codex-connector"}}],
+            }
+        )
+        harness.write_fixture(changed)
+        replay = harness.json_output(harness.run("snapshot"))
+        self.assertEqual(replay["head_oid"], first["head_oid"])
+        self.assertEqual(replay["targeted_thread_ids"], first["targeted_thread_ids"])
+        self.assertEqual(replay["decision"], first["decision"])
+        self.assertEqual(harness.graphql_count(), graphql_calls)
+        path = checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        state = load_checkpoint(path)
+        self.assertEqual(state["last_snapshot"]["head_oid"], "HEAD1")
+        self.assertEqual(state["latest_target_snapshot"]["targeted_unresolved_thread_ids"], ["T1"])
+        batch = harness.json_output(harness.run("freeze"))["batch"]
+        self.assertEqual(batch["frozen_head_oid"], "HEAD1")
+        self.assertEqual(batch["targeted_thread_ids"], ["T1"])
+        graphql_calls = harness.graphql_count()
+        wrong_phase = harness.run("snapshot")
+        self.assertNotEqual(wrong_phase.returncode, 0)
+        self.assertIn("not permitted in the current wake phase", wrong_phase.stderr)
+        self.assertEqual(harness.graphql_count(), graphql_calls)
+
+    def test_cli_wrong_wake_is_rejected_before_fetch_and_next_wake_fetches(self) -> None:
+        harness = CliHarness(self)
+        harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
+        changed = harness.read_fixture()
+        changed["head_oid"] = "HEAD2"
+        harness.write_fixture(changed)
+        wrong_wake = harness.run("snapshot", wake_id="wake-2")
+        self.assertNotEqual(wrong_wake.returncode, 0)
+        self.assertIn("not owned by the active wake", wrong_wake.stderr)
+        self.assertEqual(harness.graphql_count(), 0)
+        path = checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        state = load_checkpoint(path)
+        self.assertEqual(state["active_wake_id"], "wake-1")
+        self.assertIsNone(state["latest_target_snapshot"])
+
+        harness.json_output(harness.run("snapshot"))
+        harness.json_output(
+            harness.run(
+                "complete-wake",
+                "--schedule-reanchored",
+                now="2026-08-26T00:01:00+00:00",
+            )
+        )
+        harness.json_output(
+            harness.run(
+                "begin-wake",
+                "--pause-confirmed",
+                wake_id="wake-2",
+                now="2026-08-26T00:11:00+00:00",
+            )
+        )
+        next_snapshot = harness.json_output(
+            harness.run(
+                "snapshot",
+                wake_id="wake-2",
+                now="2026-08-26T00:11:00+00:00",
+            )
+        )
+        self.assertEqual(next_snapshot["head_oid"], "HEAD2")
+        self.assertGreater(harness.graphql_count(), 0)
 
     def test_infers_pr_target_and_reuses_one_persisted_wake(self) -> None:
         harness = CliHarness(self)

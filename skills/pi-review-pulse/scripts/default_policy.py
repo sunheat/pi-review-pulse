@@ -19,9 +19,10 @@ from typing import Any, Mapping
 
 POLICY_SCHEMA_VERSION = 1
 
-_PROFILES = {"autonomous", "supervised", "observe-only"}
+_PROFILES = {"autonomous", "observe-only"}
+_UNSUPPORTED_PROFILES = {"supervised"}
 _VALIDATION_FAILURES = {"repair", "pause"}
-_MUTATION_POLICIES = {"auto", "confirm", "never"}
+_MUTATION_POLICIES = {"auto", "never"}
 _NOTIFICATION_POLICIES = {"blockers-and-terminal", "every-wake", "silent"}
 _EXECUTION_MODES = {"unattended", "interactive"}
 
@@ -45,13 +46,6 @@ DEFAULT_POLICY: dict[str, Any] = {
 
 _PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "autonomous": {},
-    "supervised": {
-        "execution_mode": "interactive",
-        "publication": "confirm",
-        "thread_resolution": "confirm",
-        "review_trigger": "confirm",
-        "notifications": "every-wake",
-    },
     "observe-only": {
         "execution_mode": "interactive",
         "validation_failure": "pause",
@@ -118,6 +112,10 @@ def normalize_policy(raw: Mapping[str, Any] | None = None) -> dict[str, Any]:
         raise PolicyError(f"Unknown automation policy field(s): {names}")
 
     profile = raw.get("profile", DEFAULT_POLICY["profile"])
+    if profile in _UNSUPPORTED_PROFILES:
+        raise PolicyError(
+            f"profile '{profile}' is unsupported; no confirmation/resume protocol is available"
+        )
     if profile not in _PROFILES:
         raise PolicyError(f"profile must be one of {sorted(_PROFILES)}")
     policy = default_policy()
@@ -142,6 +140,10 @@ def normalize_policy(raw: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(policy["allow_test_changes"], bool):
         raise PolicyError("allow_test_changes must be boolean")
     for field in ("publication", "thread_resolution", "review_trigger"):
+        if policy[field] == "confirm":
+            raise PolicyError(
+                f"{field}=confirm is unsupported; no confirmation/resume protocol is available"
+            )
         if policy[field] not in _MUTATION_POLICIES:
             raise PolicyError(f"{field} must be one of {sorted(_MUTATION_POLICIES)}")
     policy["inline_retry_limit"] = _non_negative_int(

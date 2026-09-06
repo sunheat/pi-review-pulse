@@ -60,7 +60,7 @@ class DefaultWakeError(RuntimeError):
 
 
 def _policy_pause(state: dict[str, Any], *, now: str, operation: str) -> dict[str, Any]:
-    """Pause when a supervised policy requires a user decision."""
+    """Pause when a policy disallows the requested operation."""
     return _pause(
         state,
         reason_code="policy_requires_confirmation",
@@ -117,6 +117,8 @@ def ensure_default_lifecycle(checkpoint: dict[str, Any]) -> dict[str, Any]:
         "last_wake_id": None,
         "last_wake_result": None,
         "last_decision": None,
+        "last_snapshot_wake_id": None,
+        "wake_mutation_occurred": False,
         "review_epoch_state": _default_review_epoch(),
         "trigger_events": {},
         "automation_policy": default_policy(),
@@ -143,6 +145,10 @@ def ensure_default_lifecycle(checkpoint: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Default wake count is invalid")
     if not isinstance(result.get("trigger_events"), dict):
         raise ValueError("Default trigger events are invalid")
+    if not isinstance(result.get("last_snapshot_wake_id"), (str, type(None))):
+        raise ValueError("Default snapshot wake identity is invalid")
+    if not isinstance(result.get("wake_mutation_occurred"), bool):
+        raise ValueError("Default wake mutation state is invalid")
     retry_state = result.get("retry_state")
     if not isinstance(retry_state, dict):
         raise ValueError("Default retry state is invalid")
@@ -200,8 +206,18 @@ def _decision(action: str, reason_code: str, **details: Any) -> dict[str, Any]:
 
 
 def _set_last_result(state: dict[str, Any], result: dict[str, Any]) -> None:
+    if "mutation_occurred" in result:
+        result["mutation_occurred"] = bool(result["mutation_occurred"]) or bool(
+            state.get("wake_mutation_occurred")
+        )
     state["last_decision"] = deepcopy(result)
     state["last_wake_result"] = deepcopy(result)
+
+
+def _mark_wake_mutation(state: dict[str, Any], occurred: bool = False) -> bool:
+    """Remember actual mutations monotonically until the current wake ends."""
+    state["wake_mutation_occurred"] = bool(state.get("wake_mutation_occurred")) or bool(occurred)
+    return state["wake_mutation_occurred"]
 
 
 def _pause(
@@ -219,7 +235,7 @@ def _pause(
         action,
         reason_code,
         evidence=evidence,
-        mutation_occurred=mutation_occurred,
+        mutation_occurred=_mark_wake_mutation(state, mutation_occurred),
     )
     state["scheduled_task_disposition"] = "PAUSED"
     state["wake_phase"] = "paused"
@@ -234,12 +250,16 @@ def _pause(
             "evidence": deepcopy(evidence),
         }
     _set_last_result(state, result)
+    state["wake_mutation_occurred"] = False
     return result
 
 
 def _terminal(
     state: dict[str, Any], *, action: str, reason_code: str, now: str, **details: Any
 ) -> dict[str, Any]:
+    details["mutation_occurred"] = _mark_wake_mutation(
+        state, bool(details.get("mutation_occurred"))
+    )
     result = _decision(action, reason_code, **details)
     state["scheduled_task_disposition"] = "PAUSED"
     state["wake_phase"] = "terminal"
@@ -248,6 +268,7 @@ def _terminal(
     state["last_wake_id"] = state.get("active_wake_id") or state.get("last_wake_id")
     state["active_wake_id"] = None
     _set_last_result(state, result)
+    state["wake_mutation_occurred"] = False
     return result
 
 
@@ -322,17 +343,18 @@ def begin_wake(
     state = ensure_default_lifecycle(checkpoint)
 
     if policy_overrides is not None:
-        if state.get("wake_count", 0) > 0 or state.get("active_wake_id"):
-            raise DefaultWakeError(
-                "Policy overrides are only accepted on the initial wake; use configure-policy for an explicit update"
-            )
         try:
-            state["automation_policy"] = apply_policy_overrides(
+            updated_policy = apply_policy_overrides(
                 state.get("automation_policy"), policy_overrides
             )
         except PolicyError as error:
             raise ValueError(str(error)) from error
-        state["automation_policy_digest"] = policy_digest(state["automation_policy"])
+        if state.get("wake_count", 0) > 0 or state.get("active_wake_id"):
+            raise DefaultWakeError(
+                "Policy overrides are only accepted on the initial wake; use configure-policy for an explicit update"
+            )
+        state["automation_policy"] = updated_policy
+        state["automation_policy_digest"] = policy_digest(updated_policy)
 
     effective_cadence = (
         state["automation_policy"]["cadence_seconds"]
@@ -409,6 +431,7 @@ def begin_wake(
     # confirmation, no PR snapshot or mutation is allowed for this wake.
     state["wake_count"] += 1
     state["last_wake_id"] = wake_id
+    state["wake_mutation_occurred"] = False
     if not _pause_confirmation(pause_heartbeat):
         result = _pause(
             state,
@@ -561,6 +584,42 @@ def decide_snapshot(
     return result
 
 
+def _snapshot_replay(
+    state: dict[str, Any], wake_id: str, *, payload: bool = False
+) -> dict[str, Any] | None:
+    """Validate snapshot authority before any network retrieval.
+
+    A stored full snapshot is replayable only when its wake identity matches.
+    The latest snapshot alone is not sufficient because it can belong to an
+    earlier completed wake.
+    """
+    active_wake_id = state.get("active_wake_id")
+    if active_wake_id is None:
+        if (
+            state.get("last_wake_id") == wake_id
+            and state.get("last_snapshot_wake_id") == wake_id
+            and state.get("wake_phase") in {"paused", "terminal"}
+        ):
+            stored = state.get("last_snapshot") if payload else state.get("last_decision")
+            if isinstance(stored, dict):
+                return deepcopy(stored)
+        if state.get("last_wake_id") == wake_id:
+            raise DefaultWakeError("The requested snapshot wake has already ended")
+        _require_active_wake(state, wake_id)
+
+    _require_active_wake(state, wake_id)
+    if state.get("wake_phase") == "snapshotted":
+        if state.get("last_snapshot_wake_id") != wake_id:
+            raise DefaultWakeError("The stored snapshot is not owned by this wake")
+        stored = state.get("last_snapshot") if payload else state.get("last_decision")
+        if not isinstance(stored, dict):
+            raise DefaultWakeError("The completed snapshot cannot be replayed safely")
+        return deepcopy(stored)
+    if state.get("wake_phase") != "started":
+        raise DefaultWakeError("Snapshot is not permitted in the current wake phase")
+    return None
+
+
 def record_snapshot(
     checkpoint: dict[str, Any],
     snapshot: dict[str, Any],
@@ -570,13 +629,10 @@ def record_snapshot(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Persist one normalized snapshot and its one-wake decision."""
     state = ensure_default_lifecycle(checkpoint)
-    if state.get("wake_phase") == "paused":
-        raise DefaultWakeError("The current wake is paused and cannot continue")
-    if state.get("last_wake_id") == wake_id and state.get("active_wake_id") is None and state.get("last_wake_result"):
-        return state, deepcopy(state["last_wake_result"])
-    _require_active_wake(state, wake_id)
-    if state.get("wake_phase") == "snapshotted" and state.get("last_decision"):
-        return state, deepcopy(state["last_decision"])
+    replay = _snapshot_replay(state, wake_id)
+    if replay is not None:
+        return state, replay
+    state["last_snapshot_wake_id"] = wake_id
     state["latest_target_snapshot"] = {
         "head_oid": snapshot.get("head_oid"),
         "targeted_unresolved_thread_ids": list(snapshot.get("targeted_thread_ids") or []),
@@ -764,7 +820,15 @@ def resolve_default_thread(
     if thread_id not in batch.get("thread_outcomes", {}):
         raise DefaultWakeError("Record the thread outcome before exact resolution")
     if thread_id in batch.get("resolved_thread_ids", []):
-        return state, {"id": thread_id, "isResolved": True, "alreadyResolved": True}
+        mutation_occurred = _mark_wake_mutation(state)
+        result = {
+            "id": thread_id,
+            "isResolved": True,
+            "alreadyResolved": True,
+            "mutation_occurred": mutation_occurred,
+        }
+        _set_last_result(state, result)
+        return state, result
 
     def recheck_boundary() -> None:
         if state.get("active_wake_id") != wake_id or state.get("wake_phase") in {"paused", "terminal"}:
@@ -783,12 +847,13 @@ def resolve_default_thread(
         graphql_call=graphql_call,
     )
     state = record_resolved_thread(state, thread_id)
+    mutation_occurred = _mark_wake_mutation(state, not bool(thread.get("alreadyResolved")))
     result = {
         "next_action": "THREAD_RESOLVED",
         "reason_code": "exact_thread_resolution_confirmed",
         "thread_id": thread_id,
         "resolved": True,
-        "mutation_occurred": not bool(thread.get("alreadyResolved")),
+        "mutation_occurred": mutation_occurred,
     }
     _set_last_result(state, result)
     return state, result
@@ -815,6 +880,7 @@ def record_default_trigger(
     if head_oid and evidence.get("attempted_head_oid") != head_oid:
         raise DefaultWakeError("Review trigger evidence is for a different head")
     event = _record_default_trigger_event(state, evidence)
+    mutation_occurred = _mark_wake_mutation(state, True)
     if event.get("status") != "emitted":
         result = _pause(
             state,
@@ -829,7 +895,7 @@ def record_default_trigger(
             "next_action": "REQUEST_REVIEW",
             "reason_code": "review_trigger_recorded",
             "trigger": event,
-            "mutation_occurred": False,
+            "mutation_occurred": mutation_occurred,
         }
         _set_last_result(state, result)
     return state, result
@@ -873,6 +939,7 @@ def record_publication_result(
         state["last_wake_id"] = wake_id
         return state, result
     state = record_publication_success(state, published_commit=published_commit)
+    mutation_occurred = _mark_wake_mutation(state, bool(published_commit))
     state["retry_state"] = {
         "inline_attempts": 0,
         "wake_attempts": 0,
@@ -884,7 +951,7 @@ def record_publication_result(
         "next_action": "WAIT_REVIEW",
         "reason_code": "aggregate_publication_succeeded",
         "published_commit": published_commit,
-        "mutation_occurred": bool(published_commit),
+        "mutation_occurred": mutation_occurred,
     }
     _set_last_result(state, result)
     return state, result
@@ -913,7 +980,9 @@ def complete_wake(
     _require_active_wake(state, wake_id)
     decision = state.get("last_decision") or {}
     action = decision.get("next_action")
-    mutation_occurred = bool(decision.get("mutation_occurred"))
+    mutation_occurred = _mark_wake_mutation(
+        state, bool(decision.get("mutation_occurred"))
+    )
     if action == "RUN_BATCH":
         publication = (state.get("active_batch") or {}).get("publication") or {}
         if publication.get("status") != "succeeded":
@@ -926,7 +995,9 @@ def complete_wake(
             )
             state["last_wake_id"] = wake_id
             return state, result
-        mutation_occurred = mutation_occurred or bool(publication.get("published_commit"))
+        mutation_occurred = _mark_wake_mutation(
+            state, mutation_occurred or bool(publication.get("published_commit"))
+        )
         action = "WAIT_REVIEW"
     elif action == "REQUEST_REVIEW":
         head_oid = state.get("last_snapshot", {}).get("head_oid")
@@ -974,6 +1045,7 @@ def complete_wake(
     state["wake_phase"] = "retry_waiting" if action == "WAIT_RETRY" else "completed"
     state["last_wake_id"] = wake_id
     _set_last_result(state, result)
+    state["wake_mutation_occurred"] = False
     return state, result
 
 
@@ -1179,9 +1251,15 @@ def parse_args() -> argparse.Namespace:
         help="Count this retry only when the same validation failure made no progress",
     )
 
-    commands.add_parser(
+    configure = commands.add_parser(
         "configure-policy",
         help="Persist explicit prompt-derived default automation policy overrides",
+    )
+    configure.add_argument(
+        "--policy-json",
+        dest="policy_json",
+        default=argparse.SUPPRESS,
+        help="JSON object of policy overrides",
     )
 
     publication = commands.add_parser("publication-result", help="Persist aggregate publication outcome")
@@ -1255,6 +1333,10 @@ def main() -> None:
         raise RuntimeError("--wake-id is required")
 
     if args.command == "snapshot":
+        replay = _snapshot_replay(state, args.wake_id, payload=True)
+        if replay is not None:
+            _write(path, state, replay)
+            return
         repository = state["repository"]
         pr_number = state["pull_request_number"]
         owner, repo_name = repository.split("/", 1)

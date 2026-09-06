@@ -47,6 +47,48 @@ def started(checkpoint=None, *, wake_id: str = "wake-1", now: str = NOW):
     )
 
 
+def thread_graphql(*, head: str = "HEAD1", already_resolved: bool = False):
+    def call(query: str, variables: dict[str, object]) -> dict:
+        if "mutation" in query:
+            return {
+                "data": {
+                    "resolveReviewThread": {
+                        "thread": {
+                            "id": variables["threadId"],
+                            "isResolved": True,
+                        }
+                    }
+                }
+            }
+        return {
+            "data": {
+                "repository": {
+                    "nameWithOwner": "Owner/Repo",
+                    "pullRequest": {
+                        "number": 17,
+                        "headRefOid": head,
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "id": "T1",
+                                    "isResolved": already_resolved,
+                                    "comments": {
+                                        "nodes": [
+                                            {"author": {"login": "chatgpt-codex-connector"}}
+                                        ]
+                                    },
+                                }
+                            ],
+                        },
+                    },
+                }
+            }
+        }
+
+    return call
+
+
 class DefaultLifecycleTests(unittest.TestCase):
     def test_schema_one_checkpoint_migrates_to_policy_schema(self) -> None:
         legacy = empty_checkpoint("Owner/Repo", 17)
@@ -161,27 +203,44 @@ class DefaultLifecycleTests(unittest.TestCase):
         self.assertEqual(result["next_action"], "PAUSE_BLOCKED")
         self.assertEqual(result["reason_code"], "no_progress_limit_reached")
 
-    def test_supervised_profile_pauses_before_thread_resolution(self) -> None:
-        state, _ = pulse.begin_wake(
-            empty_checkpoint("Owner/Repo", 17),
-            wake_id="wake-1",
-            now=NOW,
-            policy_overrides={"profile": "supervised"},
-            pause_heartbeat=lambda: True,
-        )
-        state, _ = pulse.record_snapshot(
-            state, snapshot(targeted=["T1"]), wake_id="wake-1", now=NOW
-        )
-        state, _ = pulse.freeze_default_batch(state, wake_id="wake-1")
-        state, result = pulse.record_default_outcome(
+    def test_unsupported_supervised_and_confirm_modes_fail_before_wake(self) -> None:
+        for overrides in (
+            {"profile": "supervised"},
+            {"publication": "confirm"},
+            {"thread_resolution": "confirm"},
+            {"review_trigger": "confirm"},
+        ):
+            with self.subTest(overrides=overrides):
+                state = empty_checkpoint("Owner/Repo", 17)
+                before = deepcopy(state)
+                with self.assertRaisesRegex(ValueError, "unsupported"):
+                    pulse.begin_wake(
+                        state,
+                        wake_id="wake-1",
+                        now=NOW,
+                        policy_overrides=overrides,
+                        pause_heartbeat=lambda: True,
+                    )
+                self.assertEqual(state, before)
+
+    def test_unsupported_policy_update_preserves_existing_failure_latch(self) -> None:
+        state, _ = started()
+        state, _ = pulse.record_snapshot(state, snapshot(), wake_id="wake-1", now=NOW)
+        state, blocked = pulse.complete_wake(
             state,
             wake_id="wake-1",
-            thread_id="T1",
-            classification="fix-now",
-            now=NOW,
+            now="2026-08-26T00:01:00+00:00",
         )
-        self.assertEqual(result["next_action"], "PAUSE_POLICY_CONFIRMATION")
-        self.assertEqual(result["reason_code"], "policy_requires_confirmation")
+        self.assertEqual(blocked["next_action"], "PAUSE_BLOCKED")
+        before = deepcopy(state)
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            pulse.update_default_policy(
+                state,
+                overrides={"publication": "confirm"},
+                now="2026-08-26T00:02:00+00:00",
+            )
+        self.assertEqual(state, before)
+        self.assertEqual(state["failure_latch"]["reason_code"], "scheduled_task_reanchor_unavailable")
 
     def test_validation_failure_policy_can_disable_automatic_retry(self) -> None:
         state, _ = pulse.begin_wake(
@@ -269,12 +328,32 @@ class DefaultLifecycleTests(unittest.TestCase):
             pulse.record_snapshot(state, snapshot(targeted=["T1"]), wake_id="wake-1", now=NOW)
         self.assertIsNone(state.get("active_batch"))
 
-    def test_duplicate_snapshot_does_not_plan_or_increment_wake(self) -> None:
+    def test_duplicate_snapshot_ignores_changed_evidence_and_wrong_wake(self) -> None:
         state, _ = started()
-        state, first = pulse.record_snapshot(state, snapshot(), wake_id="wake-1", now=NOW)
-        state, second = pulse.record_snapshot(state, snapshot(), wake_id="wake-1", now=NOW)
+        state, first = pulse.record_snapshot(
+            state,
+            snapshot(head="HEAD1", targeted=["T1"]),
+            wake_id="wake-1",
+            now=NOW,
+        )
+        state, second = pulse.record_snapshot(
+            state,
+            snapshot(head="HEAD2", targeted=["T2"], eyes=True),
+            wake_id="wake-1",
+            now=NOW,
+        )
         self.assertEqual(first, second)
         self.assertEqual(state["wake_count"], 1)
+        self.assertEqual(state["latest_target_snapshot"]["head_oid"], "HEAD1")
+        self.assertEqual(state["latest_target_snapshot"]["targeted_unresolved_thread_ids"], ["T1"])
+        with self.assertRaises(pulse.DefaultWakeError):
+            pulse.record_snapshot(
+                state,
+                snapshot(head="HEAD3", targeted=["T3"]),
+                wake_id="wake-2",
+                now=NOW,
+            )
+        self.assertEqual(state["latest_target_snapshot"]["head_oid"], "HEAD1")
 
     def test_completion_relative_cadence_uses_completion_not_start(self) -> None:
         state, _ = started()
@@ -457,6 +536,151 @@ class DefaultLifecycleTests(unittest.TestCase):
         self.assertIsNone(result["published_commit"])
         self.assertEqual((state["active_batch"]["publication"]["status"]), "succeeded")
 
+    def test_actual_resolution_survives_no_commit_publication(self) -> None:
+        state, _ = started()
+        state, _ = pulse.record_snapshot(
+            state, snapshot(targeted=["T1"]), wake_id="wake-1", now=NOW
+        )
+        state, _ = pulse.freeze_default_batch(state, wake_id="wake-1")
+        state, _ = pulse.record_default_outcome(
+            state,
+            wake_id="wake-1",
+            thread_id="T1",
+            classification="no-fix",
+            now=NOW,
+        )
+        state, resolved = pulse.resolve_default_thread(
+            state,
+            wake_id="wake-1",
+            thread_id="T1",
+            graphql_call=thread_graphql(),
+        )
+        self.assertTrue(resolved["mutation_occurred"])
+        state, publication = pulse.record_publication_result(
+            state,
+            wake_id="wake-1",
+            status="succeeded",
+            now=NOW,
+            published_commit=None,
+        )
+        self.assertTrue(publication["mutation_occurred"])
+        state, completed = pulse.complete_wake(
+            state,
+            wake_id="wake-1",
+            now="2026-08-26T00:01:00+00:00",
+            schedule_next_wake=lambda _: True,
+        )
+        self.assertTrue(completed["mutation_occurred"])
+        self.assertTrue(state["last_wake_result"]["mutation_occurred"])
+
+    def test_already_resolved_noop_does_not_infer_historical_mutation(self) -> None:
+        state, _ = started()
+        state, _ = pulse.record_snapshot(
+            state, snapshot(targeted=["T1"]), wake_id="wake-1", now=NOW
+        )
+        state, _ = pulse.freeze_default_batch(state, wake_id="wake-1")
+        state, _ = pulse.record_default_outcome(
+            state,
+            wake_id="wake-1",
+            thread_id="T1",
+            classification="no-fix",
+            now=NOW,
+        )
+        state, resolved = pulse.resolve_default_thread(
+            state,
+            wake_id="wake-1",
+            thread_id="T1",
+            graphql_call=thread_graphql(already_resolved=True),
+        )
+        self.assertFalse(resolved["mutation_occurred"])
+        state, publication = pulse.record_publication_result(
+            state,
+            wake_id="wake-1",
+            status="succeeded",
+            now=NOW,
+            published_commit=None,
+        )
+        self.assertFalse(publication["mutation_occurred"])
+        state, completed = pulse.complete_wake(
+            state,
+            wake_id="wake-1",
+            now="2026-08-26T00:01:00+00:00",
+            schedule_next_wake=lambda _: True,
+        )
+        self.assertFalse(completed["mutation_occurred"])
+
+    def test_new_wake_resets_mutation_audit_before_historical_noop(self) -> None:
+        state, _ = started()
+        state, _ = pulse.record_snapshot(
+            state, snapshot(targeted=["T1"]), wake_id="wake-1", now=NOW
+        )
+        state, _ = pulse.freeze_default_batch(state, wake_id="wake-1")
+        state, _ = pulse.record_default_outcome(
+            state,
+            wake_id="wake-1",
+            thread_id="T1",
+            classification="no-fix",
+            now=NOW,
+        )
+        state, _ = pulse.resolve_default_thread(
+            state,
+            wake_id="wake-1",
+            thread_id="T1",
+            graphql_call=thread_graphql(),
+        )
+        state, _ = pulse.record_publication_result(
+            state,
+            wake_id="wake-1",
+            status="succeeded",
+            now=NOW,
+            published_commit=None,
+        )
+        state, completed = pulse.complete_wake(
+            state,
+            wake_id="wake-1",
+            now="2026-08-26T00:01:00+00:00",
+            schedule_next_wake=lambda _: True,
+        )
+        self.assertTrue(completed["mutation_occurred"])
+
+        state, _ = started(state, wake_id="wake-2", now="2026-08-26T00:11:00+00:00")
+        self.assertFalse(state["wake_mutation_occurred"])
+        state, _ = pulse.record_snapshot(
+            state,
+            snapshot(head="HEAD2", targeted=["T1"]),
+            wake_id="wake-2",
+            now="2026-08-26T00:11:00+00:00",
+        )
+        state, _ = pulse.freeze_default_batch(state, wake_id="wake-2")
+        state, _ = pulse.record_default_outcome(
+            state,
+            wake_id="wake-2",
+            thread_id="T1",
+            classification="no-fix",
+            now="2026-08-26T00:11:00+00:00",
+        )
+        state, resolved = pulse.resolve_default_thread(
+            state,
+            wake_id="wake-2",
+            thread_id="T1",
+            graphql_call=thread_graphql(head="HEAD2", already_resolved=True),
+        )
+        self.assertFalse(resolved["mutation_occurred"])
+        state, _ = pulse.record_publication_result(
+            state,
+            wake_id="wake-2",
+            status="succeeded",
+            now="2026-08-26T00:11:00+00:00",
+            published_commit=None,
+        )
+        state, completed = pulse.complete_wake(
+            state,
+            wake_id="wake-2",
+            now="2026-08-26T00:12:00+00:00",
+            schedule_next_wake=lambda _: True,
+        )
+        self.assertFalse(completed["mutation_occurred"])
+
     def test_completed_publication_preserves_mutation_audit_flag(self) -> None:
         state, _ = started()
         state, _ = pulse.record_snapshot(
@@ -510,7 +734,9 @@ class DefaultLifecycleTests(unittest.TestCase):
             },
         )
         self.assertEqual(result["reason_code"], "review_trigger_recorded")
-        state, _ = pulse.complete_wake(state, wake_id="wake-2", now="2026-08-26T00:12:00+00:00", schedule_next_wake=lambda _: True)
+        self.assertTrue(result["mutation_occurred"])
+        state, completed = pulse.complete_wake(state, wake_id="wake-2", now="2026-08-26T00:12:00+00:00", schedule_next_wake=lambda _: True)
+        self.assertTrue(completed["mutation_occurred"])
         state, _ = started(state, wake_id="wake-3", now="2026-08-26T00:22:00+00:00")
         state, result = pulse.record_snapshot(state, snapshot(), wake_id="wake-3", now="2026-08-26T00:22:00+00:00")
         self.assertEqual(result["next_action"], "PAUSE_BLOCKED")
