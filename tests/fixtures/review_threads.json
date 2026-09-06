@@ -1,0 +1,66 @@
+[
+  {
+    "id": "T_CODEX",
+    "isResolved": false,
+    "path": "src/core.py",
+    "comments": {
+      "nodes": [
+        {
+          "id": "C1",
+          "author": {"login": "chatgpt-codex-connector"},
+          "url": "https://example.test/t_codex"
+        }
+      ]
+    }
+  },
+  {
+    "id": "T_CODEX_BOT",
+    "isResolved": false,
+    "path": "src/core.py",
+    "comments": {
+      "nodes": [
+        {
+          "id": "C2",
+          "author": {"login": "ChatGPT-Codex-Connector[bot]"},
+          "url": "https://example.test/t_codex_bot"
+        }
+      ]
+    }
+  },
+  {
+    "id": "T_HUMAN",
+    "isResolved": false,
+    "path": "README.md",
+    "comments": {
+      "nodes": [
+        {
+          "id": "C3",
+          "author": {"login": "human-reviewer"},
+          "url": "https://example.test/t_human"
+        }
+      ]
+    }
+  },
+  {
+    "id": "T_UNKNOWN",
+    "isResolved": false,
+    "path": "README.md",
+    "comments": {"nodes": [{"id": "C4", "author": null}]}
+  },
+  {
+    "id": "T_NO_COMMENTS",
+    "isResolved": false,
+    "path": "README.md",
+    "comments": {"nodes": []}
+  },
+  {
+    "id": "T_RESOLVED",
+    "isResolved": true,
+    "path": "src/old.py",
+    "comments": {
+      "nodes": [
+        {"id": "C5", "author": {"login": "chatgpt-codex-connector"}}
+      ]
+    }
+  }
+]
