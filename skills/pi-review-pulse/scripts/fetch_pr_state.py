@@ -292,6 +292,30 @@ def verify_stable_head(
     return final_pr
 
 
+def verify_stable_review_artifacts(
+    initial_review_threads: list[dict[str, Any]],
+    final_review_threads: list[dict[str, Any]],
+    initial_review_activity: list[dict[str, Any]],
+    final_review_activity: list[dict[str, Any]],
+) -> None:
+    """Reject a snapshot assembled across a review-thread/activity change."""
+    def fingerprint(nodes: list[dict[str, Any]]) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                json.dumps(node, sort_keys=True, separators=(",", ":"))
+                for node in nodes
+            )
+        )
+
+    if (
+        fingerprint(initial_review_threads) != fingerprint(final_review_threads)
+        or fingerprint(initial_review_activity) != fingerprint(final_review_activity)
+    ):
+        raise RuntimeError(
+            "Review thread/activity artifacts changed while fetching state; retry the snapshot"
+        )
+
+
 def select_evaluation_identities(
     *,
     reviewer_logins: list[str] | None,
@@ -357,6 +381,20 @@ def fetch_stable_snapshot(
         if include_conversation
         else []
     )
+    final_review_threads = fetch_connection(
+        THREADS_QUERY, "reviewThreads", owner, repo, number,
+        graphql_call=graphql_call,
+    )
+    final_eyes_reactions = fetch_connection(
+        EYES_REACTIONS_QUERY, "reactions", owner, repo, number,
+        graphql_call=graphql_call,
+    )
+    verify_stable_review_artifacts(
+        review_threads,
+        final_review_threads,
+        eyes_reactions,
+        final_eyes_reactions,
+    )
     final_meta = graphql_call(META_QUERY, owner, repo, number, None)
     final_repository = final_meta["data"].get("repository")
     if final_repository is None:
@@ -365,9 +403,9 @@ def fetch_stable_snapshot(
     return {
         "repository": final_repository["nameWithOwner"],
         "pull_request": pull_request,
-        "review_threads": review_threads,
+        "review_threads": final_review_threads,
         "thumbs_up_reactions": thumbs_up_reactions,
-        "eyes_reactions": eyes_reactions,
+        "eyes_reactions": final_eyes_reactions,
         "reviews": reviews,
         "conversation_comments": conversation_comments,
     }

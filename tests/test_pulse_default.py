@@ -298,6 +298,25 @@ class DefaultLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(process.stdout.strip(), "")
 
+    def test_duplicate_initial_wake_replays_before_policy_override_validation(self) -> None:
+        state, first = pulse.begin_wake(
+            empty_checkpoint("Owner/Repo", 17),
+            wake_id="wake-1",
+            now=NOW,
+            policy_overrides={"max_wakes": 5},
+            pause_heartbeat=lambda: True,
+        )
+        replay, result = pulse.begin_wake(
+            state,
+            wake_id="wake-1",
+            now="2026-08-26T00:01:00+00:00",
+            policy_overrides={"max_wakes": 5},
+            pause_heartbeat=lambda: True,
+        )
+        self.assertEqual(result, first)
+        self.assertEqual(replay["wake_count"], 1)
+        self.assertEqual(replay["automation_policy"]["max_wakes"], 5)
+
     def test_wake_starts_paused_and_increments_once(self) -> None:
         state, result = started()
         self.assertEqual(result["next_action"], "WAKE_STARTED")
@@ -535,6 +554,30 @@ class DefaultLifecycleTests(unittest.TestCase):
         )
         self.assertIsNone(result["published_commit"])
         self.assertEqual((state["active_batch"]["publication"]["status"]), "succeeded")
+
+    def test_fix_now_batch_rejects_publication_without_a_commit(self) -> None:
+        state, _ = started()
+        state, _ = pulse.record_snapshot(
+            state, snapshot(targeted=["T1"]), wake_id="wake-1", now=NOW
+        )
+        state, _ = pulse.freeze_default_batch(state, wake_id="wake-1")
+        state, _ = pulse.record_default_outcome(
+            state,
+            wake_id="wake-1",
+            thread_id="T1",
+            classification="fix-now",
+            now=NOW,
+        )
+        state = record_resolved_thread(state, "T1")
+        with self.assertRaisesRegex(ValueError, "published commit"):
+            pulse.record_publication_result(
+                state,
+                wake_id="wake-1",
+                status="succeeded",
+                now=NOW,
+                published_commit=None,
+            )
+        self.assertEqual(state["active_batch"]["publication"]["status"], "not_started")
 
     def test_actual_resolution_survives_no_commit_publication(self) -> None:
         state, _ = started()

@@ -342,6 +342,12 @@ def begin_wake(
     now = _iso(now)
     state = ensure_default_lifecycle(checkpoint)
 
+    # A lost response may cause the host to retry the exact initial command.
+    # Replay the already-owned result before interpreting policy arguments;
+    # otherwise a valid policy override is mistaken for a late update.
+    if state.get("last_wake_id") == wake_id and state.get("last_wake_result"):
+        return state, deepcopy(state["last_wake_result"])
+
     if policy_overrides is not None:
         try:
             updated_policy = apply_policy_overrides(
@@ -364,8 +370,6 @@ def begin_wake(
     if isinstance(effective_cadence, bool) or not isinstance(effective_cadence, int) or effective_cadence <= 0:
         raise ValueError("Cadence must be positive")
 
-    if state.get("last_wake_id") == wake_id and state.get("last_wake_result"):
-        return state, deepcopy(state["last_wake_result"])
     if state.get("wake_phase") in {"terminal", "closed"}:
         raise DefaultWakeError(
             "The checkpoint has reached an absorbing stop; an explicit user command is required to reopen it"
@@ -456,7 +460,11 @@ def begin_wake(
     state["last_decision"] = None
     state["last_wake_result"] = None
     if pending_batch:
-        state["wake_phase"] = "processing"
+        # A retry wake must replay the frozen snapshot before the documented
+        # unconditional snapshot command can proceed.  Claim ownership of
+        # that replay for the new wake without fetching fresh review evidence.
+        state["wake_phase"] = "snapshotted"
+        state["last_snapshot_wake_id"] = wake_id
         state["last_decision"] = _decision(
             "RUN_BATCH",
             "resume_pending_batch",
@@ -614,7 +622,10 @@ def _snapshot_replay(
         stored = state.get("last_snapshot") if payload else state.get("last_decision")
         if not isinstance(stored, dict):
             raise DefaultWakeError("The completed snapshot cannot be replayed safely")
-        return deepcopy(stored)
+        replay = deepcopy(stored)
+        if payload and isinstance(state.get("last_decision"), dict):
+            replay["decision"] = deepcopy(state["last_decision"])
+        return replay
     if state.get("wake_phase") != "started":
         raise DefaultWakeError("Snapshot is not permitted in the current wake phase")
     return None

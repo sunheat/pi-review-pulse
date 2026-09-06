@@ -282,6 +282,31 @@ class PulseCliTests(unittest.TestCase):
         self.assertFalse(state["automation_policy"]["allow_test_changes"])
         self.assertEqual(state["automation_policy"]["notifications"], "every-wake")
 
+    def test_duplicate_initial_wake_with_policy_replays_without_reapplying_policy(self) -> None:
+        harness = CliHarness(self)
+        first = harness.json_output(
+            harness.run(
+                "--policy-json",
+                '{"max_wakes": 5}',
+                "begin-wake",
+                "--pause-confirmed",
+            )
+        )
+        replay = harness.json_output(
+            harness.run(
+                "--policy-json",
+                '{"max_wakes": 5}',
+                "begin-wake",
+                "--pause-confirmed",
+            )
+        )
+        self.assertEqual(replay, first)
+        state = load_checkpoint(
+            checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        )
+        self.assertEqual(state["wake_count"], 1)
+        self.assertEqual(state["automation_policy"]["max_wakes"], 5)
+
     def test_configure_policy_accepts_subcommand_policy_json_and_rejects_invalid_values(self) -> None:
         harness = CliHarness(self)
         harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
@@ -322,6 +347,7 @@ class PulseCliTests(unittest.TestCase):
             '{"profile": "supervised"}',
             "begin-wake",
             "--pause-confirmed",
+            wake_id="wake-2",
         )
         self.assertNotEqual(rejected_profile.returncode, 0)
         self.assertIn("unsupported", rejected_profile.stderr)
@@ -330,6 +356,7 @@ class PulseCliTests(unittest.TestCase):
             '{"publication": "confirm"}',
             "begin-wake",
             "--pause-confirmed",
+            wake_id="wake-2",
         )
         self.assertNotEqual(rejected_confirm.returncode, 0)
         self.assertIn("unsupported", rejected_confirm.stderr)
@@ -371,6 +398,57 @@ class PulseCliTests(unittest.TestCase):
         self.assertNotEqual(wrong_phase.returncode, 0)
         self.assertIn("not permitted in the current wake phase", wrong_phase.stderr)
         self.assertEqual(harness.graphql_count(), graphql_calls)
+
+    def test_retry_wake_replays_frozen_snapshot_before_network_fetch(self) -> None:
+        fixture = CliHarness.default_fixture()
+        fixture["threads"] = [{"id": "T1", "root_author": "chatgpt-codex-connector"}]
+        harness = CliHarness(self, fixture=fixture)
+        harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
+        harness.json_output(harness.run("snapshot"))
+        harness.json_output(harness.run("freeze"))
+        harness.json_output(
+            harness.run(
+                "retry",
+                "--reason-code",
+                "transient_validation_failure",
+                "--signature",
+                "test-failure",
+            )
+        )
+        harness.json_output(
+            harness.run(
+                "complete-wake",
+                "--schedule-reanchored",
+                now="2026-08-26T00:01:00+00:00",
+            )
+        )
+        harness.json_output(
+            harness.run(
+                "begin-wake",
+                "--pause-confirmed",
+                wake_id="wake-2",
+                now="2026-08-26T00:11:00+00:00",
+            )
+        )
+        changed = harness.read_fixture()
+        changed.update(
+            {
+                "head_oid": "HEAD2",
+                "threads": [{"id": "T2", "root_author": "chatgpt-codex-connector"}],
+                "eyes": [{"id": "EYES2", "user": {"login": "chatgpt-codex-connector"}}],
+            }
+        )
+        harness.write_fixture(changed)
+        graphql_calls = harness.graphql_count()
+        replay = harness.json_output(harness.run("snapshot", wake_id="wake-2"))
+        self.assertEqual(replay["head_oid"], "HEAD1")
+        self.assertEqual(replay["targeted_thread_ids"], ["T1"])
+        self.assertEqual(replay["decision"]["next_action"], "RUN_BATCH")
+        self.assertEqual(replay["decision"]["reason_code"], "resume_pending_batch")
+        self.assertEqual(harness.graphql_count(), graphql_calls)
+        batch = harness.json_output(harness.run("freeze", wake_id="wake-2"))["batch"]
+        self.assertEqual(batch["frozen_head_oid"], "HEAD1")
+        self.assertEqual(batch["targeted_thread_ids"], ["T1"])
 
     def test_cli_wrong_wake_is_rejected_before_fetch_and_next_wake_fetches(self) -> None:
         harness = CliHarness(self)

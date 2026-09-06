@@ -12,13 +12,18 @@ SCRIPTS = ROOT / "skills" / "pi-review-pulse" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from checkpoint_store import load_checkpoint, save_checkpoint  # noqa: E402
-from fetch_pr_state import select_evaluation_identities, verify_stable_head  # noqa: E402
+from fetch_pr_state import (  # noqa: E402
+    fetch_stable_snapshot,
+    select_evaluation_identities,
+    verify_stable_head,
+)
 from state_model import (  # noqa: E402
     classify_unresolved_threads,
     empty_checkpoint,
     evaluate_snapshot,
     freeze_batch,
     record_publication_failure,
+    record_publication_success,
     record_resolved_thread,
     record_thread_outcome,
     unique_logins,
@@ -341,6 +346,25 @@ class BatchRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "recovered first"):
             freeze_batch(checkpoint, "HEAD2", ["T2"])
 
+    def test_fix_now_batch_requires_a_published_commit(self) -> None:
+        checkpoint = empty_checkpoint("Owner/Repo", 17)
+        checkpoint = freeze_batch(checkpoint, "HEAD1", ["T1"])
+        checkpoint = record_thread_outcome(
+            checkpoint, thread_id="T1", classification="fix-now"
+        )
+        checkpoint = record_resolved_thread(checkpoint, "T1")
+        for published_commit in (None, ""):
+            with self.subTest(published_commit=published_commit):
+                with self.assertRaisesRegex(ValueError, "published commit"):
+                    record_publication_success(
+                        checkpoint, published_commit=published_commit
+                    )
+        published = record_publication_success(checkpoint, published_commit="abc123")
+        self.assertEqual(
+            published["active_batch"]["publication"],
+            {"status": "succeeded", "published_commit": "abc123"},
+        )
+
 
 class SnapshotCoherenceTests(unittest.TestCase):
     def test_head_change_across_network_reads_is_rejected(self) -> None:
@@ -354,6 +378,77 @@ class SnapshotCoherenceTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "head advanced"):
             verify_stable_head(initial, final, 17)
+
+    def test_review_thread_change_is_rejected_even_when_head_is_unchanged(self) -> None:
+        calls: list[str] = []
+        thread = {
+            "id": "T_NEW",
+            "isResolved": False,
+            "comments": {
+                "nodes": [
+                    {"id": "C_NEW", "author": {"login": "chatgpt-codex-connector"}}
+                ]
+            },
+        }
+
+        def page(connection: str, nodes: list[dict]) -> dict:
+            return {
+                "data": {
+                    "repository": {
+                        "nameWithOwner": "Owner/Repo",
+                        "pullRequest": {
+                            "number": 17,
+                            "headRefOid": "HEAD1",
+                            connection: {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": nodes,
+                            },
+                        },
+                    }
+                }
+            }
+
+        def graphql_call(
+            query: str, owner: str, repo: str, number: int, cursor: str | None
+        ) -> dict:
+            calls.append(query)
+            if "reviewThreads" in query:
+                nodes = [thread] if calls.count(query) > 1 else []
+                return page("reviewThreads", nodes)
+            if "content: EYES" in query:
+                nodes = (
+                    [{"id": "E1", "content": "EYES", "user": {"login": "chatgpt-codex-connector"}}]
+                    if calls.count(query) == 1
+                    else []
+                )
+                return page("reactions", nodes)
+            if "content: THUMBS_UP" in query:
+                return page("reactions", [])
+            if "reviews(first" in query:
+                return page("reviews", [])
+            if "comments(first" in query:
+                return page("comments", [])
+            return {
+                "data": {
+                    "repository": {
+                        "nameWithOwner": "Owner/Repo",
+                        "pullRequest": {
+                            "number": 17,
+                            "headRefOid": "HEAD1",
+                            "state": "OPEN",
+                        },
+                    }
+                }
+            }
+
+        with self.assertRaisesRegex(RuntimeError, "thread/activity artifacts changed"):
+            fetch_stable_snapshot(
+                "Owner",
+                "Repo",
+                17,
+                graphql_call=graphql_call,
+            )
+        self.assertEqual(sum("reviewThreads" in query for query in calls), 2)
 
 
 if __name__ == "__main__":

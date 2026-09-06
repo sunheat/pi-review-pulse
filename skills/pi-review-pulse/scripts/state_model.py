@@ -502,6 +502,17 @@ def record_publication_success(
     )
     if unresolved:
         raise ValueError("Cannot complete publication while frozen threads remain unresolved")
+    has_fix_now = any(
+        isinstance(outcome, dict)
+        and outcome.get("classification") == "fix-now"
+        for outcome in (batch.get("thread_outcomes") or {}).values()
+    )
+    if has_fix_now and (
+        not isinstance(published_commit, str) or not published_commit.strip()
+    ):
+        raise ValueError(
+            "A published commit is required for batches containing fix-now outcomes"
+        )
     batch["publication"] = {
         "status": "succeeded",
         "published_commit": published_commit,
