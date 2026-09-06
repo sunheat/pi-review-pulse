@@ -152,6 +152,9 @@ def ensure_default_lifecycle(checkpoint: dict[str, Any]) -> dict[str, Any]:
     retry_state = result.get("retry_state")
     if not isinstance(retry_state, dict):
         raise ValueError("Default retry state is invalid")
+    retry_state.setdefault("last_recording", None)
+    if not isinstance(retry_state.get("last_recording"), (dict, type(None))):
+        raise ValueError("Default retry recording is invalid")
     for key in ("inline_attempts", "wake_attempts", "no_progress_attempts"):
         value = retry_state.get(key, 0)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -309,8 +312,20 @@ def _record_default_trigger_event(
     _utc(evidence["created_at"])
     attempted_head = evidence["attempted_head_oid"]
     events = state.setdefault("trigger_events", {})
-    if attempted_head in events:
-        raise ValueError("A review trigger is already recorded for this head epoch")
+    existing = events.get(attempted_head)
+    if existing is not None:
+        existing_matches = isinstance(existing, dict) and (
+            existing.get("head_oid") == evidence["attempted_head_oid"]
+            and existing.get("head_before") == evidence["head_before"]
+            and existing.get("head_after") == evidence["head_after"]
+            and existing.get("comment_node_id") == evidence["comment_node_id"]
+            and existing.get("created_at") == evidence["created_at"]
+        )
+        if not existing_matches:
+            raise ValueError(
+                "Conflicting review trigger evidence is already recorded for this head epoch"
+            )
+        return deepcopy(existing)
     status = (
         "emitted"
         if evidence["head_before"] == attempted_head == evidence["head_after"]
@@ -748,10 +763,32 @@ def record_retry(
         raise ValueError("A retry signature must be a non-empty string")
     state = ensure_default_lifecycle(checkpoint)
     _require_active_wake(state, wake_id)
+    retry_request = {
+        "reason_code": reason_code,
+        "evidence": deepcopy(evidence),
+        "signature": signature,
+        "count_no_progress": count_no_progress,
+    }
+    prior_recording = state["retry_state"].get("last_recording")
+    if isinstance(prior_recording, dict) and prior_recording.get("wake_id") == wake_id:
+        if prior_recording.get("request") != retry_request:
+            raise DefaultWakeError(
+                "A different retry recording was already persisted for this wake"
+            )
+        prior_result = prior_recording.get("result")
+        if not isinstance(prior_result, dict):
+            raise DefaultWakeError("The persisted retry result cannot be replayed safely")
+        return state, deepcopy(prior_result)
+
     policy = state["automation_policy"]
     if policy["validation_failure"] == "pause":
         result = _policy_pause(state, now=_iso(now), operation="validation_failure")
         state["last_wake_id"] = wake_id
+        state["retry_state"]["last_recording"] = {
+            "wake_id": wake_id,
+            "request": retry_request,
+            "result": deepcopy(result),
+        }
         return state, result
     if count_no_progress and not signature:
         raise ValueError("A failure signature is required to count no progress")
@@ -781,6 +818,11 @@ def record_retry(
             action="PAUSE_BLOCKED",
         )
         state["last_wake_id"] = wake_id
+        state["retry_state"]["last_recording"] = {
+            "wake_id": wake_id,
+            "request": retry_request,
+            "result": deepcopy(result),
+        }
         return state, result
     wake_attempts = int(retry_state.get("wake_attempts", 0)) + 1
     retry_limit = policy.get("retry_wake_limit")
@@ -795,6 +837,11 @@ def record_retry(
             evidence=evidence,
         )
         state["last_wake_id"] = wake_id
+        state["retry_state"]["last_recording"] = {
+            "wake_id": wake_id,
+            "request": retry_request,
+            "result": deepcopy(result),
+        }
         return state, result
     retry_state["wake_attempts"] = wake_attempts
     retry_state["inline_attempts"] = 0
@@ -808,6 +855,11 @@ def record_retry(
         mutation_occurred=False,
     )
     _set_last_result(state, result)
+    state["retry_state"]["last_recording"] = {
+        "wake_id": wake_id,
+        "request": retry_request,
+        "result": deepcopy(result),
+    }
     return state, result
 
 

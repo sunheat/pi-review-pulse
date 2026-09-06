@@ -450,6 +450,91 @@ class SnapshotCoherenceTests(unittest.TestCase):
             )
         self.assertEqual(sum("reviewThreads" in query for query in calls), 2)
 
+    def test_approval_artifact_changes_are_rejected_even_when_head_is_unchanged(self) -> None:
+        approved_review = {
+            "id": "REV1",
+            "state": "APPROVED",
+            "author": {"login": "chatgpt-codex-connector"},
+            "commit": {"oid": "HEAD1"},
+        }
+
+        for changing in ("reaction", "review"):
+            with self.subTest(changing=changing):
+                calls: list[str] = []
+
+                def page(connection: str, nodes: list[dict]) -> dict:
+                    return {
+                        "data": {
+                            "repository": {
+                                "nameWithOwner": "Owner/Repo",
+                                "pullRequest": {
+                                    "number": 17,
+                                    "headRefOid": "HEAD1",
+                                    connection: {
+                                        "pageInfo": {
+                                            "hasNextPage": False,
+                                            "endCursor": None,
+                                        },
+                                        "nodes": nodes,
+                                    },
+                                },
+                            }
+                        }
+                    }
+
+                def graphql_call(
+                    query: str, owner: str, repo: str, number: int, cursor: str | None
+                ) -> dict:
+                    calls.append(query)
+                    if "reviewThreads" in query:
+                        return page("reviewThreads", [])
+                    if "content: EYES" in query:
+                        return page("reactions", [])
+                    if "content: THUMBS_UP" in query:
+                        nodes = (
+                            [reaction("R1")]
+                            if changing == "reaction" and calls.count(query) == 1
+                            else []
+                        )
+                        return page("reactions", nodes)
+                    if "reviews(first" in query:
+                        nodes = (
+                            [approved_review]
+                            if changing == "review" and calls.count(query) == 1
+                            else []
+                        )
+                        return page("reviews", nodes)
+                    if "comments(first" in query:
+                        return page("comments", [])
+                    return {
+                        "data": {
+                            "repository": {
+                                "nameWithOwner": "Owner/Repo",
+                                "pullRequest": {
+                                    "number": 17,
+                                    "headRefOid": "HEAD1",
+                                    "state": "OPEN",
+                                },
+                            }
+                        }
+                    }
+
+                with self.assertRaisesRegex(RuntimeError, "approval artifacts changed"):
+                    fetch_stable_snapshot(
+                        "Owner",
+                        "Repo",
+                        17,
+                        graphql_call=graphql_call,
+                    )
+                self.assertEqual(
+                    sum("content: THUMBS_UP" in query for query in calls),
+                    2,
+                )
+                self.assertEqual(
+                    sum("reviews(first" in query for query in calls),
+                    2,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

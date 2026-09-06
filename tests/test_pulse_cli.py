@@ -450,6 +450,126 @@ class PulseCliTests(unittest.TestCase):
         self.assertEqual(batch["frozen_head_oid"], "HEAD1")
         self.assertEqual(batch["targeted_thread_ids"], ["T1"])
 
+    def test_cli_duplicate_retry_recording_replays_without_consuming_limits(self) -> None:
+        harness = CliHarness(self)
+        harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
+        first = harness.json_output(
+            harness.run(
+                "retry",
+                "--reason-code",
+                "validation_failed",
+                "--signature",
+                "same-failure",
+                "--no-progress",
+            )
+        )
+        replay = harness.json_output(
+            harness.run(
+                "retry",
+                "--reason-code",
+                "validation_failed",
+                "--signature",
+                "same-failure",
+                "--no-progress",
+                now="2026-08-26T00:00:01+00:00",
+            )
+        )
+        self.assertEqual(replay, first)
+        state = load_checkpoint(
+            checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        )
+        self.assertEqual(state["retry_state"]["wake_attempts"], 1)
+        self.assertEqual(state["retry_state"]["no_progress_attempts"], 1)
+        before_conflict = state
+        conflict = harness.run(
+            "retry",
+            "--reason-code",
+            "validation_failed",
+            "--signature",
+            "different-failure",
+            "--no-progress",
+        )
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("different retry recording", conflict.stderr)
+        self.assertEqual(
+            load_checkpoint(
+                checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+            ),
+            before_conflict,
+        )
+
+    def test_cli_duplicate_trigger_evidence_replays_and_conflicts_are_rejected(self) -> None:
+        harness = CliHarness(self)
+        harness.json_output(harness.run("begin-wake", "--pause-confirmed"))
+        harness.json_output(harness.run("snapshot"))
+        harness.json_output(
+            harness.run(
+                "complete-wake",
+                "--schedule-reanchored",
+                now="2026-08-26T00:01:00+00:00",
+            )
+        )
+        harness.json_output(
+            harness.run(
+                "begin-wake",
+                "--pause-confirmed",
+                wake_id="wake-2",
+                now="2026-08-26T00:11:00+00:00",
+            )
+        )
+        requested = harness.json_output(
+            harness.run("snapshot", wake_id="wake-2", now="2026-08-26T00:11:00+00:00")
+        )
+        self.assertEqual(requested["decision"]["next_action"], "REQUEST_REVIEW")
+        evidence_path = harness.checkout.parent / "trigger.json"
+        evidence = {
+            "attempted_head_oid": "HEAD1",
+            "head_before": "HEAD1",
+            "head_after": "HEAD1",
+            "comment_node_id": "COMMENT1",
+            "created_at": "2026-08-26T00:11:00+00:00",
+        }
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        first = harness.json_output(
+            harness.run(
+                "trigger-result",
+                "--evidence",
+                str(evidence_path),
+                wake_id="wake-2",
+            )
+        )
+        replay = harness.json_output(
+            harness.run(
+                "trigger-result",
+                "--evidence",
+                str(evidence_path),
+                wake_id="wake-2",
+                now="2026-08-26T00:11:01+00:00",
+            )
+        )
+        self.assertEqual(replay, first)
+        before_conflict = load_checkpoint(
+            checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+        )
+        evidence_path.write_text(
+            json.dumps({**evidence, "comment_node_id": "COMMENT2"}),
+            encoding="utf-8",
+        )
+        conflict = harness.run(
+            "trigger-result",
+            "--evidence",
+            str(evidence_path),
+            wake_id="wake-2",
+        )
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("Conflicting review trigger evidence", conflict.stderr)
+        self.assertEqual(
+            load_checkpoint(
+                checkpoint_path("owner/repo", 17, repository_path=harness.checkout)
+            ),
+            before_conflict,
+        )
+
     def test_cli_wrong_wake_is_rejected_before_fetch_and_next_wake_fetches(self) -> None:
         harness = CliHarness(self)
         harness.json_output(harness.run("begin-wake", "--pause-confirmed"))

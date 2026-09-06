@@ -297,8 +297,13 @@ def verify_stable_review_artifacts(
     final_review_threads: list[dict[str, Any]],
     initial_review_activity: list[dict[str, Any]],
     final_review_activity: list[dict[str, Any]],
+    *,
+    initial_approval_reactions: list[dict[str, Any]] | None = None,
+    final_approval_reactions: list[dict[str, Any]] | None = None,
+    initial_approval_reviews: list[dict[str, Any]] | None = None,
+    final_approval_reviews: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Reject a snapshot assembled across a review-thread/activity change."""
+    """Reject a snapshot assembled across review or approval artifact changes."""
     def fingerprint(nodes: list[dict[str, Any]]) -> tuple[str, ...]:
         return tuple(
             sorted(
@@ -313,6 +318,20 @@ def verify_stable_review_artifacts(
     ):
         raise RuntimeError(
             "Review thread/activity artifacts changed while fetching state; retry the snapshot"
+        )
+
+    approval_artifact_pairs = (
+        (initial_approval_reactions, final_approval_reactions),
+        (initial_approval_reviews, final_approval_reviews),
+    )
+    if any(
+        initial is not None
+        and final is not None
+        and fingerprint(initial) != fingerprint(final)
+        for initial, final in approval_artifact_pairs
+    ):
+        raise RuntimeError(
+            "Review approval artifacts changed while fetching state; retry the snapshot"
         )
 
 
@@ -389,11 +408,23 @@ def fetch_stable_snapshot(
         EYES_REACTIONS_QUERY, "reactions", owner, repo, number,
         graphql_call=graphql_call,
     )
+    final_thumbs_up_reactions = fetch_connection(
+        REACTIONS_QUERY, "reactions", owner, repo, number,
+        graphql_call=graphql_call,
+    )
+    final_reviews = fetch_connection(
+        REVIEWS_QUERY, "reviews", owner, repo, number,
+        graphql_call=graphql_call,
+    )
     verify_stable_review_artifacts(
         review_threads,
         final_review_threads,
         eyes_reactions,
         final_eyes_reactions,
+        initial_approval_reactions=thumbs_up_reactions,
+        final_approval_reactions=final_thumbs_up_reactions,
+        initial_approval_reviews=reviews,
+        final_approval_reviews=final_reviews,
     )
     final_meta = graphql_call(META_QUERY, owner, repo, number, None)
     final_repository = final_meta["data"].get("repository")
@@ -404,9 +435,9 @@ def fetch_stable_snapshot(
         "repository": final_repository["nameWithOwner"],
         "pull_request": pull_request,
         "review_threads": final_review_threads,
-        "thumbs_up_reactions": thumbs_up_reactions,
+        "thumbs_up_reactions": final_thumbs_up_reactions,
         "eyes_reactions": final_eyes_reactions,
-        "reviews": reviews,
+        "reviews": final_reviews,
         "conversation_comments": conversation_comments,
     }
 

@@ -23,13 +23,15 @@
       "source_git_blob_oid": "0302824aa14bd7e936c2ee6503eab41d8782ea68",
       "source_content_sha256": "28e0b4c19a528a4d3d39a84d26d79fd0cf2c5d92b43066c3b4b5d54b84c71b6e",
       "destination_path": "skills/pi-review-pulse/scripts/pulse.py",
-      "destination_content_sha256": "390f2f4648067b657aed368de0c356177cdd6f5eb425a06c067ffb83d4e23eba",
+      "destination_content_sha256": "1294d411ace83225d57a9221f65fbacd009388df1743b301bb327c32e099db8c",
       "pi_local_adaptations": [
         "The Pi candidate records last_snapshot_wake_id and performs _snapshot_replay before CLI snapshot retrieval or evaluation, replaying only a current-wake owned snapshot/decision.",
         "The Pi candidate keeps wake_mutation_occurred monotonic through exact resolution, publication, trigger, pause, terminal, and completion results, and resets it at wake start/end.",
         "The Pi candidate validates policy overrides before assigning them to a checkpoint and accepts configure-policy --policy-json after the subcommand with argparse.SUPPRESS, while retaining the root-before-subcommand form.",
         "The Pi candidate replays retry-owned snapshots under the successor wake identity before allowing the documented unconditional snapshot command to continue.",
-        "The Pi candidate replays a same-wake initial result before validating policy overrides, preserving idempotency after a lost response."
+        "The Pi candidate replays a same-wake initial result before validating policy overrides, preserving idempotency after a lost response.",
+        "The Pi candidate persists the active wake's retry request/result and replays identical retry recordings without consuming retry or no-progress limits, while rejecting conflicting input.",
+        "The Pi candidate replays identical trigger evidence for a head epoch and rejects conflicting evidence without replacing the persisted event."
       ],
       "exclusions": [
         "Source heartbeat scheduling symbols are excluded: HEARTBEAT_PROTOCOL_VERSION, SCHEDULE_REANCHOR_TOLERANCE, HEARTBEAT_BATCH_ORDER, build_heartbeat_handoff, _ceil_to_second, and _schedule_times_match.",

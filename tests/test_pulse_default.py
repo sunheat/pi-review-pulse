@@ -165,6 +165,50 @@ class DefaultLifecycleTests(unittest.TestCase):
         self.assertTrue(result["resume_pending_batch"])
         self.assertEqual(state["last_decision"]["reason_code"], "resume_pending_batch")
 
+    def test_duplicate_retry_recording_replays_without_consuming_limits(self) -> None:
+        state, _ = pulse.begin_wake(
+            empty_checkpoint("Owner/Repo", 17),
+            wake_id="wake-1",
+            now=NOW,
+            policy_overrides={"no_progress_limit": 3},
+            pause_heartbeat=lambda: True,
+        )
+        state, first = pulse.record_retry(
+            state,
+            wake_id="wake-1",
+            reason_code="validation_failed",
+            now=NOW,
+            evidence={"step": "focused-test"},
+            signature="same-failure",
+            count_no_progress=True,
+        )
+        before_replay = deepcopy(state["retry_state"])
+        replay, replay_result = pulse.record_retry(
+            state,
+            wake_id="wake-1",
+            reason_code="validation_failed",
+            now="2026-08-26T00:00:01+00:00",
+            evidence={"step": "focused-test"},
+            signature="same-failure",
+            count_no_progress=True,
+        )
+        self.assertEqual(replay_result, first)
+        self.assertEqual(replay["retry_state"], before_replay)
+        self.assertEqual(replay["retry_state"]["wake_attempts"], 1)
+        self.assertEqual(replay["retry_state"]["no_progress_attempts"], 1)
+
+        with self.assertRaisesRegex(pulse.DefaultWakeError, "different retry recording"):
+            pulse.record_retry(
+                replay,
+                wake_id="wake-1",
+                reason_code="validation_failed",
+                now=NOW,
+                evidence={"step": "different-test"},
+                signature="different-failure",
+                count_no_progress=True,
+            )
+        self.assertEqual(replay["retry_state"], before_replay)
+
     def test_repeated_no_progress_reaches_pause_limit(self) -> None:
         state, _ = pulse.begin_wake(
             empty_checkpoint("Owner/Repo", 17),
@@ -765,19 +809,36 @@ class DefaultLifecycleTests(unittest.TestCase):
         state, _ = started(state, wake_id="wake-2", now="2026-08-26T00:11:00+00:00")
         state, result = pulse.record_snapshot(state, snapshot(), wake_id="wake-2", now="2026-08-26T00:11:00+00:00")
         self.assertEqual(result["next_action"], "REQUEST_REVIEW")
+        trigger_evidence = {
+            "attempted_head_oid": "HEAD1",
+            "head_before": "HEAD1",
+            "head_after": "HEAD1",
+            "comment_node_id": "COMMENT1",
+            "created_at": "2026-08-26T00:11:00+00:00",
+        }
         state, result = pulse.record_default_trigger(
             state,
             wake_id="wake-2",
-            evidence={
-                "attempted_head_oid": "HEAD1",
-                "head_before": "HEAD1",
-                "head_after": "HEAD1",
-                "comment_node_id": "COMMENT1",
-                "created_at": "2026-08-26T00:11:00+00:00",
-            },
+            evidence=trigger_evidence,
         )
         self.assertEqual(result["reason_code"], "review_trigger_recorded")
         self.assertTrue(result["mutation_occurred"])
+        replay, replay_result = pulse.record_default_trigger(
+            state,
+            wake_id="wake-2",
+            evidence=trigger_evidence,
+        )
+        self.assertEqual(replay_result, result)
+        self.assertEqual(replay["trigger_events"], state["trigger_events"])
+        before_conflict = deepcopy(replay)
+        conflicting_evidence = {**trigger_evidence, "comment_node_id": "COMMENT2"}
+        with self.assertRaisesRegex(ValueError, "Conflicting review trigger evidence"):
+            pulse.record_default_trigger(
+                replay,
+                wake_id="wake-2",
+                evidence=conflicting_evidence,
+            )
+        self.assertEqual(replay, before_conflict)
         state, completed = pulse.complete_wake(state, wake_id="wake-2", now="2026-08-26T00:12:00+00:00", schedule_next_wake=lambda _: True)
         self.assertTrue(completed["mutation_occurred"])
         state, _ = started(state, wake_id="wake-3", now="2026-08-26T00:22:00+00:00")
